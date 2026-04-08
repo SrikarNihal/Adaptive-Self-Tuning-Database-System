@@ -1,0 +1,1 @@
+SELECT 'auto_index loaded';
