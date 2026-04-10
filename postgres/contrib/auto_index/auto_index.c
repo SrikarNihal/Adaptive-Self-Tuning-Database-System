@@ -11,48 +11,45 @@
 
 PG_MODULE_MAGIC;
 
-static ExecutorRun_hook_type prev_ExecutorRun = NULL;
-static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+ExecutorRun_hook_type prev_ExecutorRun = NULL;
+ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
-static bool auto_index_in_progress = false;
+bool auto_index_in_progress = false;
 
-/* ---------------- Queue ---------------- */
 typedef struct PendingIndex {
     char table_name[64];
     char column_name[64];
     struct PendingIndex *next;
 } PendingIndex;
 
-static PendingIndex *pending_index_head = NULL;
+PendingIndex *pending_index_head = NULL;
 
-/* ---------------- Case-insensitive strstr ---------------- */
-static const char *
-ci_strstr(const char *haystack, const char *needle)
-{
-    size_t nlen = strlen(needle);
-    for (; *haystack; haystack++)
-        if (pg_strncasecmp(haystack, needle, nlen) == 0)
-            return haystack;
+char *ci_strstr(char *text, char *pattern) {
+    int nlen = strlen(pattern);
+
+    if (nlen == 0)
+        return (char *)text;
+    for (; *text; text++) {
+        if (strlen(text) < nlen)
+            return NULL;
+        if (pg_strncasecmp(text, pattern, nlen) == 0)
+            return (char *)text;
+    }
+
     return NULL;
 }
 
-/* ---------------- Detect SeqScan ---------------- */
-static bool
-plan_has_seqscan(Plan *plan)
-{
+bool plan_has_seqscan(Plan *plan){
     if (!plan) return false;
 
     if (nodeTag(plan) == T_SeqScan)
         return true;
 
-    return plan_has_seqscan(plan->lefttree) ||
-           plan_has_seqscan(plan->righttree);
+    return plan_has_seqscan(plan->lefttree) || plan_has_seqscan(plan->righttree);
 }
 
-/* ---------------- Queue ---------------- */
-static void
-enqueue_index(const char *table, const char *column)
-{
+
+void enqueue_index(char *table, char *column){
     MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
 
     PendingIndex *pi = palloc(sizeof(PendingIndex));
@@ -65,36 +62,22 @@ enqueue_index(const char *table, const char *column)
     MemoryContextSwitchTo(old);
 }
 
-/* ----------------------------------------------------------------
- * EXECUTOR RUN → DETECT ONLY
- * ---------------------------------------------------------------- */
-void
-auto_index_executor_run(QueryDesc *queryDesc,
-                        ScanDirection direction,
-                        uint64 count,
-                        bool execute_once)
-{
-    if (prev_ExecutorRun)
-        prev_ExecutorRun(queryDesc, direction, count, execute_once);
-    else
-        standard_ExecutorRun(queryDesc, direction, count, execute_once);
 
-    if (auto_index_in_progress)
-        return;
+void auto_index_executor_run(QueryDesc *queryDesc,ScanDirection direction,uint64 count,bool execute_once){
+    if (prev_ExecutorRun) prev_ExecutorRun(queryDesc, direction, count, execute_once);
+    else standard_ExecutorRun(queryDesc, direction, count, execute_once);
 
-    if (!queryDesc || !queryDesc->sourceText || !queryDesc->plannedstmt)
-        return;
+    if (auto_index_in_progress) return;
 
-    const char *query = queryDesc->sourceText;
+    if (!queryDesc || !queryDesc->sourceText || !queryDesc->plannedstmt) return;
 
-    if (!ci_strstr(query, "SELECT") || !ci_strstr(query, "WHERE"))
-        return;
+    char *query = queryDesc->sourceText;
 
-    if (!plan_has_seqscan(queryDesc->plannedstmt->planTree))
-        return;
+    if (!ci_strstr(query, "SELECT") || !ci_strstr(query, "WHERE")) return;
 
-    /* Extract table */
-    const char *from_ptr = ci_strstr(query, "FROM");
+    if (!plan_has_seqscan(queryDesc->plannedstmt->planTree)) return;
+
+    char *from_ptr = ci_strstr(query, "FROM");
     if (!from_ptr) return;
 
     from_ptr += 4;
@@ -103,12 +86,14 @@ auto_index_executor_run(QueryDesc *queryDesc,
     char table[64] = {0};
     sscanf(from_ptr, "%63s", table);
 
-    for (char *p = table; *p; p++)
-        if (!isalnum((unsigned char)*p) && *p != '_')
-            { *p = '\0'; break; }
+    for (char *p = table; *p; p++){
+        if (!isalnum((unsigned char)*p) && *p != '_'){
+            *p = '\0'; 
+            break; 
+        }
+    }
 
-    /* Extract column */
-    const char *where_ptr = ci_strstr(query, "WHERE");
+    char *where_ptr = ci_strstr(query, "WHERE");
     if (!where_ptr) return;
 
     where_ptr += 5;
@@ -117,39 +102,32 @@ auto_index_executor_run(QueryDesc *queryDesc,
     char column[64] = {0};
     sscanf(where_ptr, "%63s", column);
 
-    for (char *p = column; *p; p++)
-        if (*p == '=' || *p == '>' || *p == '<' || *p == '!')
-            { *p = '\0'; break; }
+    for (char *p = column; *p; p++){
+        if (*p == '=' || *p == '>' || *p == '<' || *p == '!'){
+            *p = '\0'; 
+            break; 
+        }
+    }
 
-    if (table[0] == '\0' || column[0] == '\0')
-        return;
+    if (table[0] == '\0' || column[0] == '\0') return;
 
     elog(WARNING, "AUTO_INDEX: SeqScan on %s(%s) — queued", table, column);
 
     enqueue_index(table, column);
 }
 
-/* ----------------------------------------------------------------
- * EXECUTOR END → SPI WORK (SAFE)
- * ---------------------------------------------------------------- */
-void
-auto_index_executor_end(QueryDesc *queryDesc)
-{
-    if (prev_ExecutorEnd)
-        prev_ExecutorEnd(queryDesc);
-    else
-        standard_ExecutorEnd(queryDesc);
 
-    if (pending_index_head == NULL || auto_index_in_progress)
-        return;
+void auto_index_executor_end(QueryDesc *queryDesc){
+    if (prev_ExecutorEnd) prev_ExecutorEnd(queryDesc);
+    else standard_ExecutorEnd(queryDesc);
+
+    if (pending_index_head == NULL || auto_index_in_progress) return;
 
     auto_index_in_progress = true;
 
-    /*  FIX: Restore snapshot */
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
+    if (SPI_connect() != SPI_OK_CONNECT){
         elog(WARNING, "AUTO_INDEX: SPI_connect failed");
         PopActiveSnapshot();
         auto_index_in_progress = false;
@@ -159,14 +137,11 @@ auto_index_executor_end(QueryDesc *queryDesc)
     PendingIndex *pi = pending_index_head;
     pending_index_head = NULL;
 
-    while (pi)
-    {
+    while (pi){
         PendingIndex *next = pi->next;
 
-        elog(WARNING, "AUTO_INDEX: processing %s(%s)",
-             pi->table_name, pi->column_name);
+        elog(WARNING, "AUTO_INDEX: processing %s(%s)",pi->table_name, pi->column_name);
 
-        /* Insert / update stats */
         char stats_query[512];
         snprintf(stats_query, sizeof(stats_query),
             "INSERT INTO column_scan_stats(table_name, column_name, scan_count) "
@@ -177,7 +152,6 @@ auto_index_executor_end(QueryDesc *queryDesc)
 
         SPI_exec(stats_query, 0);
 
-        /* Get count */
         char check_query[256];
         snprintf(check_query, sizeof(check_query),
             "SELECT scan_count FROM column_scan_stats "
@@ -187,30 +161,23 @@ auto_index_executor_end(QueryDesc *queryDesc)
         SPI_exec(check_query, 1);
 
         int scan_count = 0;
-        if (SPI_processed > 0)
-        {
-            scan_count = atoi(
-                SPI_getvalue(SPI_tuptable->vals[0],
-                             SPI_tuptable->tupdesc, 1));
+        if (SPI_processed > 0){
+            scan_count = atoi(SPI_getvalue(SPI_tuptable->vals[0],SPI_tuptable->tupdesc, 1));
         }
 
         elog(WARNING, "AUTO_INDEX: scan_count=%d", scan_count);
 
-        /* Create index */
-        if (scan_count > 5)
-        {
+        if (scan_count > 5){
             StringInfoData buf;
             initStringInfo(&buf);
 
             appendStringInfo(&buf,
                 "CREATE INDEX IF NOT EXISTS idx_%s_%s ON %s(%s);",
-                pi->table_name, pi->column_name,
-                pi->table_name, pi->column_name);
+                pi->table_name, pi->column_name,pi->table_name, pi->column_name);
 
             SPI_exec(buf.data, 0);
 
-            elog(WARNING, "AUTO_INDEX: index created on %s(%s)",
-                 pi->table_name, pi->column_name);
+            elog(WARNING, "AUTO_INDEX: index created on %s(%s)",pi->table_name, pi->column_name);
 
             pfree(buf.data);
         }
@@ -221,18 +188,12 @@ auto_index_executor_end(QueryDesc *queryDesc)
 
     SPI_finish();
 
-    /*  Restore snapshot */
     PopActiveSnapshot();
 
     auto_index_in_progress = false;
 }
 
-/* ----------------------------------------------------------------
- * INIT / FINI
- * ---------------------------------------------------------------- */
-void
-_PG_init(void)
-{
+void _PG_init(void){
     elog(WARNING, "AUTO_INDEX LOADED");
 
     prev_ExecutorRun = ExecutorRun_hook;
@@ -242,9 +203,7 @@ _PG_init(void)
     ExecutorEnd_hook = auto_index_executor_end;
 }
 
-void
-_PG_fini(void)
-{
+void _PG_fini(void){
     ExecutorRun_hook = prev_ExecutorRun;
     ExecutorEnd_hook = prev_ExecutorEnd;
 }
